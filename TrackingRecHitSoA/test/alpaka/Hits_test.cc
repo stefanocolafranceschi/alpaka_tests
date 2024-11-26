@@ -17,69 +17,80 @@
 
 using namespace ALPAKA_ACCELERATOR_NAMESPACE;
 
-int main() {
-  // Get the list of devices on the current platform
-  auto const& devices = cms::alpakatools::devices<Platform>();
+class HitsTestRunner {
+public:
+    HitsTestRunner(const std::vector<Device>& devices, uint32_t nHits, int32_t offset)
+        : nHits_(nHits), offset_(offset) {
+        devices_ = cms::alpakatools::devices<Platform>();
+        if (devices_.empty()) {
+            std::cerr << "No devices available for the " EDM_STRINGIZE(ALPAKA_ACCELERATOR_NAMESPACE) " backend, "
+                      << "the test will be skipped.\n";
+            exit(EXIT_FAILURE);
+        }
 
-
-  // Let's see if anything is found and print more about the list
-  if (devices.empty()) {
-    std::cerr << "No devices available for the " EDM_STRINGIZE(ALPAKA_ACCELERATOR_NAMESPACE) " backend, "
-      "the test will be skipped.\n";
-    exit(EXIT_FAILURE);
-  }
-  else {
-    // Print the number of devices
-    std::cout << "Found " << devices.size() << " device(s)." << std::endl;
-
-    // Iterate through each device and print details (like device name or properties)
-    for (size_t i = 0; i < devices.size(); ++i) {
-        const auto& device = devices[i];
-        
-        std::cout << "Device " << i << " type: " << typeid(device).name() << std::endl;
+        printDeviceInfo();
     }
-  }
 
+    void run() {
+        for (const auto& device : devices_) {
+            Queue queue(device);
+            runOnDevice(queue);
+        }
+    }
 
+private:
+    void printDeviceInfo() const {
+        std::cout << "Found " << devices_.size() << " device(s)." << std::endl;
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            const auto& device = devices_[i];
+            std::cout << "Device " << i << " type: " << typeid(device).name() << std::endl;
+        }
+    }
 
-  // Run the test on each device
-  for (const auto& device : devices) {
-    Queue queue(device);
+    void runOnDevice(Queue& queue) {
+        // Allocate and initialize memory
+        auto moduleStartH =
+            cms::alpakatools::make_host_buffer<uint32_t[]>(queue, pixelTopology::Phase1::numberOfModules + 1);
+        for (size_t i = 0; i < pixelTopology::Phase1::numberOfModules + 1; ++i) {
+            moduleStartH[i] = i * 2;
+        }
+        auto moduleStartD =
+            cms::alpakatools::make_device_buffer<uint32_t[]>(queue, pixelTopology::Phase1::numberOfModules + 1);
+        alpaka::memcpy(queue, moduleStartD, moduleStartH);
 
-    // inner scope to deallocate memory before destroying the queue
-    {
-      uint32_t nHits = 1900;
-      int32_t offset = 100;
+        TrackingRecHitsSoACollection<pixelTopology::Phase1> tkhit(queue, nHits_, offset_, moduleStartD.data());
 
-      auto moduleStartH =
-          cms::alpakatools::make_host_buffer<uint32_t[]>(queue, pixelTopology::Phase1::numberOfModules + 1);
-      for (size_t i = 0; i < pixelTopology::Phase1::numberOfModules + 1; ++i) {
-        moduleStartH[i] = i * 2;
-      }
-      auto moduleStartD =
-          cms::alpakatools::make_device_buffer<uint32_t[]>(queue, pixelTopology::Phase1::numberOfModules + 1);
-      alpaka::memcpy(queue, moduleStartD, moduleStartH);
-      TrackingRecHitsSoACollection<pixelTopology::Phase1> tkhit(queue, nHits, offset, moduleStartD.data());
+        // Execute kernels
+        testTrackingRecHitSoA::runKernels<pixelTopology::Phase1>(tkhit.view(), queue);
 
-      testTrackingRecHitSoA::runKernels<pixelTopology::Phase1>(tkhit.view(), queue);
-      tkhit.updateFromDevice(queue);
-
+        // Synchronize and check results
+        tkhit.updateFromDevice(queue);
 #if defined ALPAKA_ACC_CPU_B_SEQ_T_SEQ_ENABLED or defined ALPAKA_ACC_CPU_B_TBB_T_SEQ_ENABLED
-      // requires c++23 to make cms::alpakatools::CopyToHost compile using if constexpr
-      // see https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p2593r0.html
-      TrackingRecHitHost<pixelTopology::Phase1> const& host_collection = tkhit;
+        TrackingRecHitHost<pixelTopology::Phase1> const& host_collection = tkhit;
 #else
-      TrackingRecHitHost<pixelTopology::Phase1> host_collection =
-          cms::alpakatools::CopyToHost<TrackingRecHitDevice<pixelTopology::Phase1, Device> >::copyAsync(queue, tkhit);
+        TrackingRecHitHost<pixelTopology::Phase1> host_collection =
+            cms::alpakatools::CopyToHost<TrackingRecHitDevice<pixelTopology::Phase1, Device> >::copyAsync(queue, tkhit);
 #endif
-      // wait for the kernel and the potential copy to complete
-      alpaka::wait(queue);
-      assert(tkhit.nHits() == nHits);
-      assert(tkhit.offsetBPIX2() == 22);  // set in the kernel
-      assert(tkhit.nHits() == host_collection.nHits());
-      assert(tkhit.offsetBPIX2() == host_collection.offsetBPIX2());
-    }
-  }
+        alpaka::wait(queue);
 
-  return EXIT_SUCCESS;
+        // Verify results
+        assert(tkhit.nHits() == nHits_);
+        assert(tkhit.offsetBPIX2() == 22);  // Set in the kernel
+        assert(tkhit.nHits() == host_collection.nHits());
+        assert(tkhit.offsetBPIX2() == host_collection.offsetBPIX2());
+    }
+
+    std::vector<Device> devices_;
+    uint32_t nHits_;
+    int32_t offset_;
+};
+
+int main() {
+    uint32_t nHits = 1900;
+    int32_t offset = 100;
+
+    HitsTestRunner runner(cms::alpakatools::devices<Platform>(), nHits, offset);
+    runner.run();
+
+    return EXIT_SUCCESS;
 }
